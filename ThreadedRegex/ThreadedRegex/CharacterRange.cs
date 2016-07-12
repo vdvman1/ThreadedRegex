@@ -1,6 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Text;
+using System.Linq;
 
 namespace ThreadedRegex
 {
@@ -27,7 +27,17 @@ namespace ThreadedRegex
             }
         }
 
-        private readonly List<Range> _ranges = new List<Range>();
+        private List<Range> _ranges;
+
+        private CharacterRange(List<Range> ranges)
+        {
+            _ranges = ranges;
+        }
+
+        public CharacterRange()
+        {
+            _ranges = new List<Range>();
+        }
 
         private int Find(int val)
         {
@@ -57,6 +67,11 @@ namespace ThreadedRegex
         public void Add(string c)
         {
             var val = char.ConvertToUtf32(c, 0);
+            Add(val);
+        }
+
+        private void Add(int val)
+        {
             if (_ranges.Count == 0)
             {
                 _ranges.Add(new Range(val, val));
@@ -109,6 +124,11 @@ namespace ThreadedRegex
         {
             var valA = char.ConvertToUtf32(a, 0);
             var valB = char.ConvertToUtf32(b, 0);
+            AddRange(valA, valB);
+        }
+
+        private void AddRange(int valA, int valB)
+        {
             if (_ranges.Count == 0)
             {
                 _ranges.Add(new Range(valA, valB));
@@ -163,6 +183,11 @@ namespace ThreadedRegex
         public void Remove(string c)
         {
             var val = char.ConvertToUtf32(c, 0);
+            Remove(val);
+        }
+
+        private void Remove(int val)
+        {
             if (_ranges.Count == 0)
             {
                 return;
@@ -196,6 +221,11 @@ namespace ThreadedRegex
         {
             var valA = char.ConvertToUtf32(a, 0);
             var valB = char.ConvertToUtf32(b, 0);
+            RemoveRange(valA, valB);
+        }
+
+        private void RemoveRange(int valA, int valB)
+        {
             var indexA = Find(valA);
             var indexB = Find(valB);
             if (indexA == indexB && indexA < 0)
@@ -212,38 +242,30 @@ namespace ThreadedRegex
                 indexB = ~indexB;
             }
             Range rangeAboveA;
-            Range rangeBelowA;
             Range rangeAboveB;
-            Range rangeBelowB;
             if (indexA == _ranges.Count)
             {
                 rangeAboveA = new Range(int.MaxValue, int.MaxValue);
-                rangeBelowA = _ranges[indexA - 1];
             }
             else if (indexA == 0)
             {
                 rangeAboveA = _ranges[indexA];
-                rangeBelowA = new Range(int.MinValue, int.MinValue);
             }
             else
             {
                 rangeAboveA = _ranges[indexA];
-                rangeBelowA = _ranges[indexA];
             }
             if (indexB == _ranges.Count)
             {
                 rangeAboveB = new Range(int.MaxValue, int.MaxValue);
-                rangeBelowB = _ranges[indexB - 1];
             }
             else if (indexB == 0)
             {
                 rangeAboveB = _ranges[indexB];
-                rangeBelowB = new Range(int.MinValue, int.MinValue);
             }
             else
             {
                 rangeAboveB = _ranges[indexB];
-                rangeBelowB = _ranges[indexB - 1];
             }
 
             if (indexA == indexB)
@@ -288,6 +310,48 @@ namespace ThreadedRegex
             _ranges.RemoveRange(start, end - start + 1);
         }
 
+        public void Subtract(CharacterRange charRange)
+        {
+            foreach (var range in charRange._ranges)
+            {
+                if (range.Low == range.High)
+                {
+                    Remove(range.Low);
+                }
+                else
+                {
+                    RemoveRange(range.Low, range.High);
+                }
+            }
+        }
+
+        public void Intersection(CharacterRange charRange)
+        {
+            charRange = charRange.Clone();
+            charRange.Negate();
+            Subtract(charRange);
+        }
+
+        public void Negate()
+        {
+            var preRanges = _ranges;
+            _ranges = new List<Range>();
+            if (preRanges[0].Low > 0)
+            {
+                _ranges.Add(new Range(0, preRanges[0].Low - 1));
+            }
+            for (var i = 1; i < preRanges.Count; i++)
+            {
+                _ranges.Add(new Range(preRanges[i - 1].High + 1, preRanges[i].Low - 1));
+            }
+            const int maxCodePoint = 0x10FFFF;
+            var last = preRanges.Last();
+            if (last.High < maxCodePoint)
+            {
+                _ranges.Add(new Range(preRanges.Last().High + 1, maxCodePoint));
+            }
+        }
+
         public bool IsIncluded(string c)
         {
             return Find(char.ConvertToUtf32(c, 0)) >= 0;
@@ -296,6 +360,12 @@ namespace ThreadedRegex
         public override string ToString()
         {
             return "[" + string.Join("", _ranges) + "]";
+        }
+
+        public CharacterRange Clone()
+        {
+            var ranges = _ranges.Select(range => range).ToList(); // Clone list
+            return new CharacterRange(ranges);
         }
     }
 }
