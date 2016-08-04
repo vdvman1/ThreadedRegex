@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text;
@@ -11,56 +12,92 @@ namespace ThreadedRegex.Parser
         // TODO: Group numbering
 
         private readonly string _regex;
-        private readonly StringInfo _regexInfo;
         private readonly int[] _indexs;
         private int _pos;
-        internal RegexParser(string regex)
+        private readonly Stack<bool> _freeSpacing = new Stack<bool>();
+        internal RegexParser(string regex, bool freeSpacing)
         {
             _regex = regex;
-            _regexInfo = new StringInfo(_regex);
             _indexs = StringInfo.ParseCombiningCharacters(regex);
+            _freeSpacing.Push(freeSpacing);
         }
 
-        private string Next()
+        private string Next(bool allowFreeSpace, int count = 1)
         {
-            var c = Look;
-            _pos++;
-            return c;
+            var result = new StringBuilder();
+            for (var i = 0; i < count; i++)
+            {
+                string c;
+                bool isWhite;
+                do
+                {
+                    c = StringInfo.GetNextTextElement(_regex, _indexs[_pos]);
+                    if (allowFreeSpace && _freeSpacing.Peek() && char.IsWhiteSpace(c, 0))
+                    {
+                        isWhite = true;
+                        _pos++;
+                    }
+                    else
+                    {
+                        isWhite = false;
+                    }
+                } while (isWhite);
+                result.Append(c);
+                _pos++;
+            }
+            return result.ToString();
         }
 
-        private string LookAhead(int length)
+        private void MovePrev(bool allowFreeSpace)
         {
-            return _regexInfo.SubstringByTextElements(_pos, length);
+            string c;
+            do
+            {
+                _pos--;
+                c = Look(false);
+            } while (allowFreeSpace && _freeSpacing.Peek() && char.IsWhiteSpace(c, 0));
         }
 
-        private string Look => StringInfo.GetNextTextElement(_regex, _indexs[_pos]);
+        private string Look(bool allowFreeSpace, int count = 1)
+        {
+            int start = _pos;
+            string str = Next(allowFreeSpace, count);
+            _pos = start;
+            return str;
+        }
 
         internal AST Parse()
         {
             var alternation = new AlternationBuilder();
-            alternation.Add(Expr()); // TODO
+            do
+            {
+                alternation.Add(Expr());
+            } while (Next(true) == "|");
+            MovePrev(true);
             return null;
         }
 
         private AST Expr()
         {
             var concat = new ConcatBuilder();
-            while (Look != "|")
+            string c = Look(true);
+            while (c != "|" && c != ")")
             {
-                var atom = Atom();
+                AST atom = Atom();
                 if (atom == null)
                 {
                     break;
                 }
-                var quantifier = Quantifier(atom);
+                AST quantifier = Quantifier(atom);
                 concat.Add(quantifier);
+                c = Look(true);
             }
             return concat.Build();
         }
 
         private AST Quantifier(AST atom)
         {
-            var c = Look;
+            string c = Look(false);
             Quantified quant;
             switch (c)
             {
@@ -76,20 +113,19 @@ namespace ThreadedRegex.Parser
                 default:
                     return atom;
             }
-            _pos++;
-            c = Look;
+            Next(false);
+            c = Next(false);
             switch (c)
             {
                 case "?":
                     quant.laziness = Quantified.Laziness.Lazy;
-                    _pos++;
                     break;
                 case "+":
                     quant.laziness = Quantified.Laziness.Possesive;
-                    _pos++;
                     break;
                 default:
                     quant.laziness = Quantified.Laziness.Greedy;
+                    MovePrev(false);
                     break;
             }
             return quant;
@@ -97,11 +133,11 @@ namespace ThreadedRegex.Parser
 
         private AST Atom()
         {
-            if (Look == ")")
+            if (Look(true) == ")")
             {
                 return null;
             }
-            var c = Next();
+            string c = Next(true);
             switch (c)
             {
                 case @"\":
@@ -121,13 +157,13 @@ namespace ThreadedRegex.Parser
 
         private AST Group()
         {
-            var c = Look;
+            string c = Look(false);
             if (c != "?")
             {
                 return new Group(GroupContent());
             }
-            _pos++;
-            c = Next();
+            Next(false);
+            c = Next(true);
             switch (c)
             {
                 case "-":
@@ -137,32 +173,41 @@ namespace ThreadedRegex.Parser
                 case "x":
                 case "n":
                 case "d":
-                    _pos--;
-                    var mods = ParseModifiers();
-                    _pos--;
-                    if (Next() == ")")
+                    MovePrev(true);
+                    bool hasX;
+                    bool enableFreeSpacing;
+                    Modifiers mods = ParseModifiers(out enableFreeSpacing, out hasX);
+                    MovePrev(true);
+                    if (Next(true) == ")")
                     {
+                        if (hasX)
+                        {
+                            _freeSpacing.Pop();
+                            _freeSpacing.Push(enableFreeSpacing);
+                        }
                         return mods;
                     }
-                    return new Group(GroupContent(), mods);
+                    _freeSpacing.Push(enableFreeSpacing);
+                    return new Group(GroupContent(hasX), mods);
                 case "=":
                     return new LookAhead(GroupContent(), false);
                 case "!":
                     return new LookAhead(GroupContent(), true);
                 case "(":
-                    if (LookAhead(7) == "DEFINE)")
+                    const string define = "DEFINE)";
+                    if (Look(false, define.Length) == define)
                     {
-                        _pos += 7;
+                        _pos += define.Length;
                         var concatBuilder = new ConcatBuilder();
                         while (c != ")")
                         {
-                            c = Next();
+                            c = Next(true);
                             if (c != "(")
                             {
                                 return null;
                             }
                             concatBuilder.Add(NamedGroup());
-                            c = Look;
+                            c = Look(true);
                         }
                         return concatBuilder.Build();
                     }
@@ -173,14 +218,14 @@ namespace ThreadedRegex.Parser
                 case "#":
                     while (c != ")")
                     {
-                        c = Next();
+                        c = Next(false); // Save extra looping and checking
                     }
                     return null;
                 case "C":
                     // TODO: callouts
                     break;
                 default:
-                    var named = NamedGroup();
+                    AST named = NamedGroup();
                     if (named != null)
                     {
                         return named;
@@ -193,33 +238,41 @@ namespace ThreadedRegex.Parser
 
         private AST NamedGroup()
         {
-            var c = Next();
+            string c = Next(false);
+            var isDefinetelyNamed = false;
             if (c == "P")
             {
-                c = Next();
+                isDefinetelyNamed = true;
+                c = Next(false);
             }
             if (c != "<") return null;
-            c = Next();
-            if (c == "=" || c == "!") return new LookBehind(GroupContent(), c == "!");
-            _pos--;
-            var name = Name(">");
-            _pos--;
-            if (name == null || Next() != ">")
+            c = Next(false);
+            if (!isDefinetelyNamed && (c == "=" || c == "!")) return new LookBehind(GroupContent(), c == "!");
+            MovePrev(false);
+            string name = Name(">");
+            MovePrev(false);
+            if (name == null || Next(false) != ">")
             {
                 return null;
             }
             return new Group(GroupContent(), name: name);
         }
 
-        private AST GroupContent()
+        private AST GroupContent(bool hasX = false)
         {
-            var inner = Parse();
-            return Next() == ")" ? new Group(inner) : null;
+            AST inner = Parse();
+            if (hasX)
+            {
+                _freeSpacing.Pop();
+            }
+            return Next(true) == ")" ? inner : null;
         }
 
-        private Modifiers ParseModifiers()
+        private Modifiers ParseModifiers(out bool enableFreeSpacing, out bool hasX)
         {
-            var c = Next();
+            enableFreeSpacing = false;
+            hasX = false;
+            string c = Next(true);
             var mods = new Modifiers();
             var negated = false;
             while (c != ")" && c != ":")
@@ -245,7 +298,9 @@ namespace ThreadedRegex.Parser
                         mods.Add(Modifier.ModifierType.M, negated);
                         negated = false;
                         break;
-                    case "x": // TODO: enable freespacing
+                    case "x":
+                        hasX = true;
+                        enableFreeSpacing = !negated;
                         mods.Add(Modifier.ModifierType.X, negated);
                         negated = false;
                         break;
@@ -260,7 +315,7 @@ namespace ThreadedRegex.Parser
                     default:
                         return null;
                 }
-                c = Next();
+                c = Next(!negated);
             }
             return mods;
         }
@@ -269,58 +324,63 @@ namespace ThreadedRegex.Parser
         {
             // TODO: handle inbuilt character classes (e.g. \d, \p{IsArabic}, ...) and other escaped characters
             var classBuilder = new CharacterClassBuilder();
-            var c = Next();
+            string c = Next(false);
             if (c == "^")
             {
                 classBuilder.Negate = true;
-                c = Next();
+                c = Next(false);
             }
 
             // Special case at beggining of class
             if (c == "-")
             {
-                if (Look == "-")
+                if (Look(false) == "-")
                 {
-                    _pos++;
-                    classBuilder.AddRange(c, Next());
+                    Next(false);
+                    classBuilder.AddRange(c, Next(false));
                 }
                 else
                 {
-                    classBuilder.Add(c); // Includes ']'
+                    classBuilder.Add(c);
                 }
             }
             else if (c == "]")
             {
                 classBuilder.Add(c);
+                if (Look(false) == "-")
+                {
+                    Next(false);
+                    classBuilder.AddRange(c, Next(false));
+                }
             }
 
             while (c != "]")
             {
-                if (Look == "-")
+                const string and = "&&";
+                if (Look(false) == "-")
                 {
-                    _pos++;
-                    if (Look == "[")
+                    Next(false);
+                    if (Look(false) == "[")
                     {
-                        _pos++;
-                        var innerClass = CharClass();
+                        Next(false);
+                        CharacterClass innerClass = CharClass();
                         classBuilder.Subtract(innerClass);
-                        if (Look != "]")
+                        if (Look(false) != "]")
                         {
                             return null;
                         }
                     }
                     else
                     {
-                        var second = Next();
-                        classBuilder.AddRange(c, second);
+                        classBuilder.AddRange(c, Next(false));
                     }
                 }
-                else if (LookAhead(2) == "&&")
+                else if (Look(false, and.Length) == and)
                 {
-                    _pos += 2;
-                    var innerClass = CharClass();
+                    _pos += and.Length;
+                    CharacterClass innerClass = CharClass();
                     classBuilder.Intersect(innerClass);
-                    if (Look != "]")
+                    if (Look(false) != "]")
                     {
                         return null;
                     }
@@ -328,7 +388,7 @@ namespace ThreadedRegex.Parser
                 else
                 {
                     classBuilder.Add(c);
-                    c = Next();
+                    c = Next(false);
                 }
             }
             return classBuilder.Build();
@@ -336,7 +396,7 @@ namespace ThreadedRegex.Parser
 
         private AST Escape()
         {
-            var c = Next();
+            string c = Next(false);
             AST node;
             switch (c)
             {
@@ -353,32 +413,33 @@ namespace ThreadedRegex.Parser
                 case "B":
                     return new Not(new WordBoundry());
                 case "k":
-                    if (Next() != "<")
+                    if (Next(false) != "<")
                     {
                         return null;
                     }
                     node = BackRef(true, ">");
-                    _pos--;
-                    return Next() == ">" ? node : null;
+                    MovePrev(false);
+                    return Next(false) == ">" ? node : null;
                 case "g":
-                    if (Next() != "{")
+                    if (Next(false) != "{")
                     {
                         return null;
                     }
                     node = BackRef(false, "}");
-                    _pos--;
-                    return Next() == "}" ? node : null;
+                    MovePrev(false);
+                    return Next(false) == "}" ? node : null;
                 case "Q":
-                    var end = LookAhead(2);
+                    const string ending = @"\E";
+                    string end = Look(false, ending.Length);
                     var builder = new ConcatBuilder();
-                    while (end != @"\E")
+                    while (end != ending)
                     {
                         if (end == null)
                         {
                             return null;
                         }
-                        builder.Add(new StrNode(Next()));
-                        end = LookAhead(2);
+                        builder.Add(new StrNode(Next(false)));
+                        end = Look(false, ending.Length);
                     }
                     return builder.Build();
                 case "d":
@@ -416,43 +477,43 @@ namespace ThreadedRegex.Parser
                 case "a":
                     return new AlarmChar();
                 case "c":
-                    c = Next();
+                    c = Next(false);
                     return c.All(character => character <= 127) ? new Control(c) : null; // Is ascii
                 case "e":
                     return new EscapeChar();
                 case "o":
-                    if (Next() != "{")
+                    if (Next(false) != "{")
                     {
                         return null;
                     }
                     c = Num(8);
-                    return Next() == "}" ? new StrNode(c) : null;
+                    return Next(false) == "}" ? new StrNode(c) : null;
                 case "x":
-                    if (Look == "{")
+                    if (Look(false) == "{")
                     {
-                        Next();
+                        Next(false);
                         c = Num(16);
-                        return Next() == "}" ? new StrNode(c) : null;
+                        return Next(false) == "}" ? new StrNode(c) : null;
                     }
                     c = Num(16, 2);
                     return new StrNode(c);
                 case "p":
-                    if (Next() != "{")
+                    if (Next(false) != "{")
                     {
                         return null;
                     }
                     var strBuilder = new StringBuilder();
-                    c = Next();
+                    c = Next(false);
                     while (c != "}")
                     {
                         strBuilder.Append(c);
-                        c = Next();
+                        c = Next(false);
                     }
                     return new Category(strBuilder.ToString());
                 default:
                     if (!char.IsDigit(c, 0)) return new StrNode(c);
 
-                    _pos--;
+                    MovePrev(false);
                     if (c != "0") return BackRef(false); // Determine at match time if octal character
 
                     // Definetely octal, by specicification
@@ -464,12 +525,12 @@ namespace ThreadedRegex.Parser
         private string Num(int numBase)
         {
             var builder = new StringBuilder();
-            var c = Look;
+            string c = Look(false);
             while (char.IsDigit(c, 0))
             {
-                _pos++;
+                Next(false);
                 builder.Append(c);
-                c = Look;
+                c = Look(false);
             }
             return Convert.ToInt32(builder.ToString(), numBase).ToString();
         }
@@ -477,12 +538,12 @@ namespace ThreadedRegex.Parser
         private string Num(int numBase, int maxLength)
         {
             var builder = new StringBuilder();
-            var c = Look;
+            string c = Look(false);
             while (char.IsDigit(c, 0) && builder.Length < maxLength)
             {
-                _pos++;
+                Next(false);
                 builder.Append(c);
-                c = Look;
+                c = Look(false);
             }
             return Convert.ToInt32(builder.ToString(), numBase).ToString();
         }
@@ -490,43 +551,43 @@ namespace ThreadedRegex.Parser
         private string Name(string end)
         {
             var builder = new StringBuilder();
-            var c = Next();
+            string c = Next(false);
             if (!c.IsUnicodeIdentifierStart())
             {
                 return null;
             }
             builder.Append(c);
-            c = Next();
+            c = Next(false);
             while (c.IsUnicodeIdentifierPart() && c != end)
             {
                 builder.Append(c);
-                c = Next();
+                c = Next(false);
             }
             return builder.ToString();
         }
 
         private AST BackRef(bool named, string end = null)
         {
-            var start = _pos;
+            int start = _pos;
             if (named)
             {
-                var name = Name(end);
+                string name = Name(end);
                 if (name != null)
                 {
                     return new BackReference(name);
                 }
             }
             _pos = start;
-            var c = Next();
+            string c = Next(false);
             var builder = new StringBuilder();
             if (!char.IsDigit(c, 0)) return null;
             
             while (char.IsDigit(c, 0) && c != end)
             {
                 builder.Append(c);
-                c = Next();
+                c = Next(false);
             }
-            var num = int.Parse(builder.ToString());
+            int num = int.Parse(builder.ToString());
             return new BackReference(num);
         }
     }
