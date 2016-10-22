@@ -1,6 +1,6 @@
 ﻿using System.Globalization;
 
-namespace ThreadedRegex
+namespace ThreadedRegex.Utility
 {
     public static class StringExtensions
     {

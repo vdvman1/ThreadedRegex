@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 
-namespace ThreadedRegex
+namespace ThreadedRegex.Utility
 {
     public class CharacterRange
     {

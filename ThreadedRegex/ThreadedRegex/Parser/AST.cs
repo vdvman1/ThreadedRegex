@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using ThreadedRegex.Utility;
 
 namespace ThreadedRegex.Parser
 {

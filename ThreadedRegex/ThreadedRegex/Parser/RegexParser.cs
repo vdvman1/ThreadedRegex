@@ -2,18 +2,186 @@
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using ThreadedRegex.Utility;
 
 namespace ThreadedRegex.Parser
 {
     internal class RegexParser
     {
+        private static readonly ParseTree ExprTree = new ParseTree(ParseFlag.RepeatChildren)
+        {
+            {
+                @"\", () => EscapeTree
+            },
+            c => new StrNode(c)
+        };
+
+        private static readonly ParseTree EscapeTree = new ParseTree
+        {
+            {"A", () => new BeginString()},
+            {"z", () => new EndString(false)},
+            {"Z", () => new EndString(true)},
+            {"G", () => new BeginStringOrMatch()},
+            {"b", () => new WordBoundry()},
+            {"B", () => new Not(new WordBoundry())},
+            {
+                "k", new ParseTree
+                {
+                    {"<", BackRefTree(true), ">"}
+                }
+            },
+            {
+                "g", new ParseTree
+                {
+                    {"{", BackRefTree(false), "}"}
+                }
+            },
+            {
+                "Q", new ParseTree(ParseFlag.RepeatChildren)
+                {
+                    {
+                        @"\", new ParseTree
+                        {
+                            {"E", new MatchComplete()}
+                        }
+                    },
+                    c => new StrNode(c)
+                }
+            },
+            {"d", () => new Digit()},
+            {"D", () => new Not(new Digit())},
+            {"w", () => new Word()},
+            {"W", () => new Not(new Word())},
+            {"s", () => new Space()},
+            {"S", () => new Not(new Space())},
+            {"t", () => new Tab()},
+            {"r", () => new CarriageReturn()},
+            {"R", () => new LineBreak()},
+            {"n", () => new LineFeed()},
+            {"N", () => new Not(new LineFeed())},
+            {"h", () => new HorizontalSpace()},
+            {"H", () => new Not(new HorizontalSpace())},
+            {"v", () => new VerticalSpace()},
+            {"V", () => new Not(new VerticalSpace())},
+            {"K", () => new ClearMatch()},
+            {"a", () => new AlarmChar()},
+            {
+                "c", new ParseTree
+                {
+                    {c => c.All(character => character < 128), "ASCII Character", c => new Control(c)}
+                }
+            },
+            {"e", () => new EscapeChar()},
+            {
+                "o", new ParseTree
+                {
+                    {
+                        "{", new StringParseTree(ParseFlag.RepeatChildren)
+                        {
+                            {
+                                c => char.IsDigit(c, 0), "Digit",
+                                new StringParseTree(ParseFlag.Repeat,
+                                    num => new StrNode(char.ConvertFromUtf32(Convert.ToInt32(num, 8))))
+                            }
+                        },
+                        "}"
+                    }
+                }
+            },
+            {
+                "x", new ParseTree
+                {
+                    {
+                        "{", new StringParseTree(ParseFlag.RepeatChildren)
+                        {
+                            {
+                                c => char.IsDigit(c, 0), "Digit",
+                                new StringParseTree(ParseFlag.Repeat,
+                                    num => new StrNode(char.ConvertFromUtf32(Convert.ToInt32(num, 8))))
+                            }
+                        },
+                        "}"
+                    },
+                    new StringParseTree
+                    {
+                        {
+                            c => char.IsDigit(c, 0), "Digit", new StringParseTree
+                            {
+                                {
+                                    c => char.IsDigit(c, 0), "Digit",
+                                    new StringParseTree(
+                                        match: num => new StrNode(char.ConvertFromUtf32(Convert.ToInt32(num, 8))))
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "p", new ParseTree
+                {
+                    {
+                        "{", new StringParseTree(match: cat => new Category(cat))
+                        {
+                            {c => true, "Anything", new StringParseTree(ParseFlag.Repeat)}
+                        },
+                        "}"
+                    }
+                }
+            },
+            {c => !char.IsDigit(c, 0), "Not digit", c => new StrNode(c)},
+            new StringParseTree
+            {
+                {
+                    "0", new StringParseTree
+                    {
+                        {
+                            c => char.IsDigit(c, 0), "Digit", new StringParseTree
+                            {
+                                {
+                                    c => char.IsDigit(c, 0), "Digit",
+                                    new StringParseTree(
+                                        match: num => new StrNode(char.ConvertFromUtf32(Convert.ToInt32(num, 8))))
+                                }
+                            }
+                        }
+                    }
+                },
+                BackRefTree(false) // Determine at match time if octal character or backreference
+            },
+        };
+
+        private static StringParseTree BackRefTree(bool named)
+        {
+            var tree = new StringParseTree
+            {
+                {
+                    c => char.IsDigit(c, 0), "Digit",
+                    new StringParseTree(ParseFlag.Repeat, name => new BackReference(int.Parse(name)))
+                }
+            };
+            if (named)
+            {
+                tree.Add(c => c.IsUnicodeIdentifierStart(), "Unicode Identifier Start",
+                    new StringParseTree(match: name => new BackReference(name))
+                    {
+                        {
+                            c => c.IsUnicodeIdentifierPart(), "Unicode Identifier Part",
+                            new StringParseTree(ParseFlag.Repeat)
+                        }
+                    });
+            }
+            return tree;
+        }
+
+        private readonly int[] _indexs;
         // TODO: Error reporting
         // TODO: Group numbering
 
         private readonly string _regex;
         private readonly StringInfo _regexInfo;
-        private readonly int[] _indexs;
         private int _pos;
+
         internal RegexParser(string regex)
         {
             _regex = regex;
@@ -21,9 +189,11 @@ namespace ThreadedRegex.Parser
             _indexs = StringInfo.ParseCombiningCharacters(regex);
         }
 
+        private string Look => StringInfo.GetNextTextElement(_regex, _indexs[_pos]);
+
         private string Next()
         {
-            var c = Look;
+            string c = Look;
             _pos++;
             return c;
         }
@@ -33,7 +203,6 @@ namespace ThreadedRegex.Parser
             return _regexInfo.SubstringByTextElements(_pos, length);
         }
 
-        private string Look => StringInfo.GetNextTextElement(_regex, _indexs[_pos]);
 
         internal AST Parse()
         {
@@ -47,12 +216,12 @@ namespace ThreadedRegex.Parser
             var concat = new ConcatBuilder();
             while (Look != "|")
             {
-                var atom = Atom();
+                AST atom = Atom();
                 if (atom == null)
                 {
                     break;
                 }
-                var quantifier = Quantifier(atom);
+                AST quantifier = Quantifier(atom);
                 concat.Add(quantifier);
             }
             return concat.Build();
@@ -60,7 +229,7 @@ namespace ThreadedRegex.Parser
 
         private AST Quantifier(AST atom)
         {
-            var c = Look;
+            string c = Look;
             Quantified quant;
             switch (c)
             {
@@ -101,7 +270,7 @@ namespace ThreadedRegex.Parser
             {
                 return null;
             }
-            var c = Next();
+            string c = Next();
             switch (c)
             {
                 case @"\":
@@ -121,7 +290,7 @@ namespace ThreadedRegex.Parser
 
         private AST Group()
         {
-            var c = Look;
+            string c = Look;
             if (c != "?")
             {
                 return new Group(GroupContent());
@@ -138,7 +307,7 @@ namespace ThreadedRegex.Parser
                 case "n":
                 case "d":
                     _pos--;
-                    var mods = ParseModifiers();
+                    Modifiers mods = ParseModifiers();
                     _pos--;
                     if (Next() == ")")
                     {
@@ -180,7 +349,7 @@ namespace ThreadedRegex.Parser
                     // TODO: callouts
                     break;
                 default:
-                    var named = NamedGroup();
+                    AST named = NamedGroup();
                     if (named != null)
                     {
                         return named;
@@ -193,18 +362,24 @@ namespace ThreadedRegex.Parser
 
         private AST NamedGroup()
         {
-            var c = Next();
+            string c = Next();
             if (c == "P")
             {
                 c = Next();
             }
-            if (c != "<") return null;
+            if (c != "<")
+            {
+                return null;
+            }
             c = Next();
-            if (c == "=" || c == "!") return new LookBehind(GroupContent(), c == "!");
+            if ((c == "=") || (c == "!"))
+            {
+                return new LookBehind(GroupContent(), c == "!");
+            }
             _pos--;
-            var name = Name(">");
+            string name = Name(">");
             _pos--;
-            if (name == null || Next() != ">")
+            if ((name == null) || (Next() != ">"))
             {
                 return null;
             }
@@ -213,16 +388,16 @@ namespace ThreadedRegex.Parser
 
         private AST GroupContent()
         {
-            var inner = Parse();
+            AST inner = Parse();
             return Next() == ")" ? new Group(inner) : null;
         }
 
         private Modifiers ParseModifiers()
         {
-            var c = Next();
+            string c = Next();
             var mods = new Modifiers();
             var negated = false;
-            while (c != ")" && c != ":")
+            while ((c != ")") && (c != ":"))
             {
                 switch (c)
                 {
@@ -269,7 +444,7 @@ namespace ThreadedRegex.Parser
         {
             // TODO: handle inbuilt character classes (e.g. \d, \p{IsArabic}, ...) and other escaped characters
             var classBuilder = new CharacterClassBuilder();
-            var c = Next();
+            string c = Next();
             if (c == "^")
             {
                 classBuilder.Negate = true;
@@ -302,7 +477,7 @@ namespace ThreadedRegex.Parser
                     if (Look == "[")
                     {
                         _pos++;
-                        var innerClass = CharClass();
+                        CharacterClass innerClass = CharClass();
                         classBuilder.Subtract(innerClass);
                         if (Look != "]")
                         {
@@ -311,14 +486,14 @@ namespace ThreadedRegex.Parser
                     }
                     else
                     {
-                        var second = Next();
+                        string second = Next();
                         classBuilder.AddRange(c, second);
                     }
                 }
                 else if (LookAhead(2) == "&&")
                 {
                     _pos += 2;
-                    var innerClass = CharClass();
+                    CharacterClass innerClass = CharClass();
                     classBuilder.Intersect(innerClass);
                     if (Look != "]")
                     {
@@ -334,9 +509,8 @@ namespace ThreadedRegex.Parser
             return classBuilder.Build();
         }
 
-        private AST Escape()
+        private AST Escape(string c)
         {
-            var c = Next();
             AST node;
             switch (c)
             {
@@ -369,7 +543,7 @@ namespace ThreadedRegex.Parser
                     _pos--;
                     return Next() == "}" ? node : null;
                 case "Q":
-                    var end = LookAhead(2);
+                    string end = LookAhead(2);
                     var builder = new ConcatBuilder();
                     while (end != @"\E")
                     {
@@ -450,10 +624,16 @@ namespace ThreadedRegex.Parser
                     }
                     return new Category(strBuilder.ToString());
                 default:
-                    if (!char.IsDigit(c, 0)) return new StrNode(c);
+                    if (!char.IsDigit(c, 0))
+                    {
+                        return new StrNode(c);
+                    }
 
                     _pos--;
-                    if (c != "0") return BackRef(false); // Determine at match time if octal character
+                    if (c != "0")
+                    {
+                        return BackRef(false); // Determine at match time if octal character
+                    }
 
                     // Definetely octal, by specicification
                     c = Num(8, 3);
@@ -461,10 +641,16 @@ namespace ThreadedRegex.Parser
             }
         }
 
+        private AST Escape()
+        {
+            string c = Next();
+            return Escape(c);
+        }
+
         private string Num(int numBase)
         {
             var builder = new StringBuilder();
-            var c = Look;
+            string c = Look;
             while (char.IsDigit(c, 0))
             {
                 _pos++;
@@ -477,8 +663,8 @@ namespace ThreadedRegex.Parser
         private string Num(int numBase, int maxLength)
         {
             var builder = new StringBuilder();
-            var c = Look;
-            while (char.IsDigit(c, 0) && builder.Length < maxLength)
+            string c = Look;
+            while (char.IsDigit(c, 0) && (builder.Length < maxLength))
             {
                 _pos++;
                 builder.Append(c);
@@ -490,44 +676,52 @@ namespace ThreadedRegex.Parser
         private string Name(string end)
         {
             var builder = new StringBuilder();
-            var c = Next();
+            string c = Next();
             if (!c.IsUnicodeIdentifierStart())
             {
                 return null;
             }
             builder.Append(c);
             c = Next();
-            while (c.IsUnicodeIdentifierPart() && c != end)
+            while (c.IsUnicodeIdentifierPart() && (c != end))
             {
                 builder.Append(c);
                 c = Next();
             }
-            return builder.ToString();
+            return (c == end) || (end == null) ? builder.ToString() : null;
         }
 
         private AST BackRef(bool named, string end = null)
         {
-            var start = _pos;
+            int start = _pos;
             if (named)
             {
-                var name = Name(end);
+                string name = Name(end);
                 if (name != null)
                 {
                     return new BackReference(name);
                 }
             }
             _pos = start;
-            var c = Next();
+            string c = Next();
             var builder = new StringBuilder();
-            if (!char.IsDigit(c, 0)) return null;
-            
-            while (char.IsDigit(c, 0) && c != end)
+            if (!char.IsDigit(c, 0))
+            {
+                return null;
+            }
+
+            while (char.IsDigit(c, 0) && (c != end))
             {
                 builder.Append(c);
                 c = Next();
             }
-            var num = int.Parse(builder.ToString());
+            int num = int.Parse(builder.ToString());
             return new BackReference(num);
         }
+    }
+
+    internal class ParserState
+    {
+        public readonly StringBuilder Builder = new StringBuilder();
     }
 }
