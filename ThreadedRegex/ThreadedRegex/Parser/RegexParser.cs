@@ -719,9 +719,4 @@ namespace ThreadedRegex.Parser
             return new BackReference(num);
         }
     }
-
-    internal class ParserState
-    {
-        public readonly StringBuilder Builder = new StringBuilder();
-    }
 }

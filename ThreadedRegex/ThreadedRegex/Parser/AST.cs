@@ -4,7 +4,7 @@ using ThreadedRegex.Utility;
 
 namespace ThreadedRegex.Parser
 {
-    internal class AST
+    public class AST
     {
     }
 

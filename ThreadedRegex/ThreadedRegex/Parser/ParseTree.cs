@@ -1,319 +1,307 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
+using System.Globalization;
+using System.Text;
 using ThreadedRegex.Utility;
 
 namespace ThreadedRegex.Parser
 {
-    internal interface IParseTree : IEnumerable
+    public class ParserState
     {
-        bool IgnoreSpace { get; }
-        Func<AST, AST> Process { get; }
-        ParseFlag Flags { get; }
-        IEither<IParseTree, AST> this[string prefix, ParserState state] { get; }
-        void Repeat(string prefix);
+        internal readonly StringBuilder Builder = new StringBuilder();
     }
 
-    internal class ParseTree : IParseTree
+    internal class Prefix
     {
-        private readonly Dictionary<string, Lazy<IParseTree>> children = new Dictionary<string, Lazy<IParseTree>>();
-        private readonly Dictionary<string, Func<AST>> astChildren = new Dictionary<string, Func<AST>>();
-
-        private readonly List<Tuple<Func<string, bool>, string, Func<string, AST>>> astPredicates =
-            new List<Tuple<Func<string, bool>, string, Func<string, AST>>>();
-
-        private readonly List<Tuple<Func<string, bool>, string, Lazy<IParseTree>>> childPredicates =
-            new List<Tuple<Func<string, bool>, string, Lazy<IParseTree>>>();
-
-        private Func<string, AST> defaultNode;
-        private Lazy<IParseTree> defaultTree;
-
-        public ParseTree(ParseFlag flags = ParseFlag.None, bool ignoreSpace = false, Func<AST, AST> process = null,
-            Lazy<IParseTree> defaultTree = null)
+        public Prefix(IEither<string, Func<string, bool>> either)
         {
-            this.defaultTree = defaultTree;
-            Flags = flags;
-            Process = process;
-            IgnoreSpace = ignoreSpace;
+            Either = either;
         }
 
-        public void Add(string key, IParseTree val)
+        public Prefix(string prefix)
         {
-            if ((val.Flags & ParseFlag.Repeat) != 0)
-            {
-                val.Repeat(key);
-            }
-            Add(key, () => val);
+            Either = Utility.Either.Of<string, Func<string, bool>>(prefix);
         }
 
-        public void Add(string key, StringParseTree tree, string delimiter)
+        public Prefix(Func<string, bool> predicate)
         {
-            tree.Delimiter = delimiter;
-            Add(key, tree);
+            Either = Utility.Either.Of<string, Func<string, bool>>(predicate);
         }
 
-        public void Add(string key, Func<IParseTree> val)
+        public IEither<string, Func<string, bool>> Either { get; }
+
+        public bool Matches(string prefix)
         {
-            children.Add(key, new Lazy<IParseTree>(val));
+            return Either.Case(pref => prefix == pref, predicate => predicate(prefix));
+        }
+    }
+
+    public class ParseTree {}
+
+    public abstract class ParseNode
+    {
+        internal virtual bool IgnoreSpace { get; set; }
+        public virtual int PrefixSize => 1;
+        protected bool shouldRepeat = false;
+
+        internal abstract IParseResult this[string prefix, int repeatCount] { get; }
+
+        internal virtual bool ShouldRepeat(int repeatCount)
+        {
+            return shouldRepeat;
         }
 
-        public void Add(string key, Func<AST> val)
+        public static ThenNode For(string prefix)
         {
-            astChildren.Add(key, val);
+            return new ThenNode(prefix);
         }
 
-        public void Add(Func<string, AST> defaultNode)
+        public static ThenNode For(Func<string, bool> predicate)
         {
-            this.defaultNode = defaultNode;
+            return new ThenNode(predicate);
+        }
+    }
+
+    public class SingleChild : ParseNode
+    {
+        private int prefixSize = -1;
+
+        internal SingleChild(Prefix prefix, ParseNode child)
+        {
+            Prefix = prefix;
+            Child = child;
         }
 
-        IEnumerator IEnumerable.GetEnumerator()
-        {
-            return children.Cast<object>().Concat(astPredicates).GetEnumerator();
-        }
+        internal Prefix Prefix { get; }
+        internal ParseNode Child { get; }
 
-        public bool IgnoreSpace { get; }
-        public Func<AST, AST> Process { get; }
-        public ParseFlag Flags { get; }
-
-        public IEither<IParseTree, AST> this[string prefix, ParserState state]
+        public override int PrefixSize
         {
             get
             {
-                if (children.ContainsKey(prefix))
+                if (prefixSize == -1)
                 {
-                    return Either.Of<IParseTree, AST>(children[prefix].Value);
+                    prefixSize = Prefix.Either.Case(
+                        prefix => new StringInfo(prefix).LengthInTextElements,
+                        predicate => 1
+                        );
                 }
-                if (astChildren.ContainsKey(prefix))
-                {
-                    return Either.Of<IParseTree, AST>(astChildren[prefix]());
-                }
-                foreach (Tuple<Func<string, bool>, string, Func<string, AST>> predicate in astPredicates)
-                {
-                    if (!predicate.Item1(prefix)) continue;
-
-                    return Either.Of<IParseTree, AST>(predicate.Item3(prefix));
-                }
-                foreach (Tuple<Func<string, bool>, string, Lazy<IParseTree>> predicate in childPredicates)
-                {
-                    if (!predicate.Item1(prefix)) continue;
-
-                    return Either.Of<IParseTree, AST>(predicate.Item3.Value);
-                }
-                if (defaultNode != null)
-                {
-                    return Either.Of<IParseTree, AST>(defaultNode(prefix));
-                }
-                if (defaultTree != null)
-                {
-                    return defaultTree.Value[prefix, state];
-                }
-                throw new ParseException(children.Keys);
+                return prefixSize;
             }
         }
 
-        public void Add(Func<string, bool> predicate, string name, Func<string, AST> node)
-        {
-            astPredicates.Add(new Tuple<Func<string, bool>, string, Func<string, AST>>(predicate, name, node));
-        }
-
-        public void Add(Func<string, bool> predicate, string name, Func<IParseTree> node)
-        {
-            childPredicates.Add(new Tuple<Func<string, bool>, string, Lazy<IParseTree>>(predicate, name,
-                new Lazy<IParseTree>(node)));
-        }
-
-        public void Add(Func<string, bool> predicate, string name, IParseTree node)
-        {
-            Add(predicate, name, () => node);
-        }
-
-        public void Add(IParseTree defaultTree)
-        {
-            Add(() => defaultTree);
-        }
-
-        public void Add(Func<IParseTree> defaultTree)
-        {
-            this.defaultTree = new Lazy<IParseTree>(defaultTree);
-        }
-
-        public void Repeat(string prefix)
-        {
-            Add(prefix, () => this);
-        }
-    }
-
-    internal class StringParseTree : IParseTree
-    {
-        private readonly List<Tuple<Func<string, bool>, string, StringParseTree>> predicates =
-            new List<Tuple<Func<string, bool>, string, StringParseTree>>();
-
-        private readonly Dictionary<string, StringParseTree> children = new Dictionary<string, StringParseTree>();
-
-        private Func<string, AST> match;
-        public string Delimiter { get; internal set; }
-        private string repeatStr;
-        private Tuple<Func<string, bool>, string> repeat;
-        private Lazy<StringParseTree> defaultTree;
-
-        public StringParseTree(ParseFlag flags = ParseFlag.None, Func<string, AST> match = null)
-        {
-            this.match = match;
-            Flags = flags;
-        }
-
-        public bool IgnoreSpace { get; } = false;
-        public Func<AST, AST> Process { get; } = null;
-        public ParseFlag Flags { get; }
-
-        public IEither<IParseTree, AST> this[string prefix, ParserState state]
+        internal override IParseResult this[string prefix, int repeatCount]
         {
             get
             {
-                if (prefix == Delimiter)
+                if (Prefix.Matches(prefix))
                 {
-                    string str = state.Builder.ToString();
-                    if (string.IsNullOrEmpty(str))
-                    {
-                        throw new ParseException("Delimiter was reached before any contents was found");
-                    }
-                    state.Builder.Clear();
-                    return Either.Of<IParseTree, AST>(match(str));
+                    return new ParseNext(Child);
                 }
-                if (children.ContainsKey(prefix))
-                {
-                    state.Builder.Append(prefix);
-                    StringParseTree tree = children[prefix];
-                    if (tree.Delimiter == null)
-                    {
-                        tree.Delimiter = Delimiter;
-                    }
-                    if (tree.match == null)
-                    {
-                        tree.match = match;
-                    }
-                    return Either.Of<IParseTree, AST>(tree);
-                }
-                foreach (Tuple<Func<string, bool>, string, StringParseTree> predicate in predicates)
-                {
-                    if (!predicate.Item1(prefix)) continue;
-
-                    state.Builder.Append(prefix);
-                    StringParseTree tree = predicate.Item3;
-                    if (tree.Delimiter == null)
-                    {
-                        tree.Delimiter = Delimiter;
-                    }
-                    if (tree.match == null)
-                    {
-                        tree.match = match;
-                    }
-                    return Either.Of<IParseTree, AST>(tree);
-                }
-                if (prefix == repeatStr)
-                {
-                    return Either.Of<IParseTree, AST>(this);
-                }
-
-                if (repeat != null)
-                {
-                    if (repeat.Item1(prefix))
-                    {
-                        return Either.Of<IParseTree, AST>(this);
-                    }
-                }
-
-                if (defaultTree != null)
-                {
-                    return defaultTree.Value[prefix, state];
-                }
-
-                IEnumerable<string> names = predicates.Select(predicate => predicate.Item2);
-                if (repeatStr != null)
-                {
-                    names = names.Concat(new[] {repeatStr});
-                }
-                if (repeat != null)
-                {
-                    names = names.Concat(new[] {repeat.Item2});
-                }
-                throw new ParseException(names);
+                return new MatchFail();
             }
         }
+    }
 
-        public void Repeat(string prefix)
+    internal interface IResultNode {}
+
+    public class ResultNode : SingleChild, IResultNode
+    {
+        internal ResultNode(Prefix prefix, Func<AST, AST> result) : base(prefix, null)
         {
-            repeatStr = prefix;
+            Result = result;
         }
 
-        public void Add(Func<string, bool> predicate, string name, StringParseTree tree)
+        internal Func<AST, AST> Result { get; }
+
+        internal override IParseResult this[string prefix, int repeatCount]
         {
-            if ((tree.Flags & ParseFlag.Repeat) != 0)
+            get
             {
-                tree.Repeat(predicate, name);
+                if (Prefix.Matches(prefix))
+                {
+                    return new ParseMatch(this);
+                }
+                return new MatchFail();
             }
-            predicates.Add(new Tuple<Func<string, bool>, string, StringParseTree>(predicate, name, tree));
-        }
-
-        private void Repeat(Func<string, bool> predicate, string name)
-        {
-            repeat = new Tuple<Func<string, bool>, string>(predicate, name);
-        }
-
-        public void Add(string prefix, StringParseTree tree)
-        {
-            children.Add(prefix, tree);
-        }
-        public void Add(StringParseTree defaultTree)
-        {
-            Add(() => defaultTree);
-        }
-
-        public void Add(Func<StringParseTree> defaultTree)
-        {
-            this.defaultTree = new Lazy<StringParseTree>(defaultTree);
-        }
-
-        public IEnumerator GetEnumerator()
-        {
-            return predicates.GetEnumerator();
         }
     }
 
-    /**
-     * Marker class for a complete match that returns nothing
-     * Indicates that the nearest repeating parent should be repeated
-     **/
+    internal interface IParseResult {}
 
-    internal class MatchComplete : IParseTree
+    internal class ParseMatch : IParseResult
     {
-        public IEnumerator GetEnumerator()
+        internal ParseMatch(IResultNode result)
         {
-            throw new NotImplementedException();
+            Result = result;
         }
 
-        public bool IgnoreSpace { get; }
-        public Func<AST, AST> Process { get; }
-        public ParseFlag Flags { get; }
+        internal IResultNode Result { get; }
+    }
 
-        public IEither<IParseTree, AST> this[string prefix, ParserState state]
+    public class MatchFail : IParseResult {}
+
+    public class ParseNext : IParseResult
+    {
+        public ParseNext(ParseNode next)
         {
-            get { throw new NotImplementedException(); }
+            Next = next;
         }
 
-        public void Repeat(string prefix)
+        internal ParseNode Next { get; }
+    }
+
+    public class RetryParse : IParseResult
+    {
+        public RetryParse(ParseNode next)
         {
-            throw new NotImplementedException();
+            Next = next;
+        }
+
+        public ParseNode Next { get; }
+    }
+
+    public class ThenNode
+    {
+        internal readonly List<Prefix> Nodes = new List<Prefix>();
+        internal OrBuilder Parent { get; }
+
+        internal ThenNode(string prefix)
+        {
+            Then(prefix);
+        }
+
+        internal ThenNode(Func<string, bool> predicate)
+        {
+            Nodes.Add(new Prefix(predicate));
+        }
+
+        internal ThenNode(OrBuilder parent, string prefix) : this(prefix)
+        {
+            Parent = parent;
+        }
+
+        public ParseNode ParseAs(Func<AST, AST> result)
+        {
+            int i = Nodes.Count - 1;
+            ParseNode res = new ResultNode(Nodes[i], result);
+            for (i--; i >= 0; i--)
+            {
+                res = new SingleChild(Nodes[i], res);
+            }
+            return res;
+        }
+
+        public ThenNode Then(string prefix)
+        {
+            Prefix node = Nodes[Nodes.Count - 1];
+            string newPref = node.Either.Case(pref => pref + prefix, pred => null);
+            if (newPref == null)
+            {
+                Nodes.Add(new Prefix(prefix));
+            }
+            else
+            {
+                Nodes[Nodes.Count - 1] = new Prefix(newPref);
+            }
+            return this;
+        }
+
+        public ThenNode Then(Func<string, bool> predicate)
+        {
+            Nodes.Add(new Prefix(predicate));
+            return this;
+        }
+
+        public OrBuilder Then(SingleChild node)
+        {
+            return new OrBuilder(this).Or(node);
         }
     }
 
-    [Flags]
-    internal enum ParseFlag
+    public class OrBuilder
     {
-        None = 0,
-        Repeat = 1 << 0,
-        RepeatChildren = 1 << 1
+        private readonly Dictionary<Func<string, bool>, ParseNode> dynNodes =
+            new Dictionary<Func<string, bool>, ParseNode>();
+
+        private readonly Dictionary<string, ParseNode> nodes = new Dictionary<string, ParseNode>();
+
+        public OrBuilder(ThenNode parent)
+        {
+            Parent = parent;
+        }
+
+        private ThenNode Parent { get; }
+
+        public OrBuilder Or(SingleChild node)
+        {
+            node.Prefix.Either.Case(
+                prefix => nodes.Add(prefix, node.Child),
+                predicate => dynNodes.Add(predicate, node.Child)
+                );
+            return this;
+        }
+
+        public ParseNode Compile()
+        {
+            ParseNode node = new OrNode(dynNodes, nodes);
+            for (int i = Parent.Nodes.Count - 1; i >= 0; i--)
+            {
+                node = new SingleChild(Parent.Nodes[i], node);
+            }
+            return node;
+        }
+
+        public ThenNode Then(string prefix)
+        {
+            return new ThenNode(this, prefix);
+        }
+    }
+
+    public class OrNode : ParseNode
+    {
+        private readonly Dictionary<Func<string, bool>, ParseNode> dynNodes;
+
+        private readonly Dictionary<string, ParseNode> nodes;
+        private ParseNode Next { get; }
+
+        internal OrNode(Dictionary<Func<string, bool>, ParseNode> dynNodes, Dictionary<string, ParseNode> nodes)
+        {
+            this.dynNodes = dynNodes;
+            this.nodes = nodes;
+        }
+
+        internal OrNode(Dictionary<Func<string, bool>, ParseNode> dynNodes, Dictionary<string, ParseNode> nodes, ParseNode next) : this(dynNodes, nodes)
+        {
+            Next = next;
+        }
+
+        internal override bool ShouldRepeat(int repeatCount)
+        {
+            return base.ShouldRepeat(repeatCount) || ((Next != null) && (repeatCount == 0));
+        }
+
+        internal override IParseResult this[string prefix, int repeatCount]
+        {
+            get
+            {
+                if ((Next != null) && (repeatCount == 1))
+                {
+                    return new RetryParse(Next);
+                }
+                if (nodes.ContainsKey(prefix))
+                {
+                    return new ParseNext(nodes[prefix]);
+                }
+                foreach (KeyValuePair<Func<string, bool>, ParseNode> node in dynNodes)
+                {
+                    if (node.Key(prefix))
+                    {
+                        return new ParseNext(node.Value);
+                    }
+                }
+                return new MatchFail();
+            }
+        }
     }
 }
